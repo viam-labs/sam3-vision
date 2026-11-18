@@ -9,11 +9,19 @@ detections and 3D point clouds. The point-cloud pipeline is carried over from
 
 ```json
 {
-  "camera_name": "realsense",
-  "mlmodel_name": "sam3",
-  "label": "stemless wine glass"
+  "name": "sam3-segments",
+  "api": "rdk:service:vision",
+  "model": "viam:sam3-vision:sam3-segments",
+  "attributes": {
+    "camera_name": "realsense",
+    "mlmodel_name": "sam3",
+    "label": "stemless wine glass"
+  }
 }
 ```
+
+The camera's `GetImages` must return a color image and a depth image (named with `color`/`rgb` and
+`depth`, otherwise the first two images are used in that order).
 
 | Attribute | Default | Notes |
 |---|---|---|
@@ -30,6 +38,15 @@ detections and 3D point clouds. The point-cloud pipeline is carried over from
 | `detector_name` | — | Optional vision service whose boxes filter SAM3 results |
 | `highlighting_on`, `highlight_color` | off, green | Mask overlay on `capture_all_from_camera` images |
 | `debug` | `false` | Also return each cloud before cleaning |
+
+## DoCommand
+
+- `{"command": "get_object_point_clouds"}` returns `{"objects": [...]}`, best confidence first. Each object has
+  `label`, `confidence`, `reference_frame`, `num_points`, and `center_mm` / `dims_mm` / `min_mm` / `max_mm`
+  as `{x, y, z}` (axis-aligned box in `reference_frame`, `world` when the frame system is available).
+  Failures return `{"error": "..."}`. Used by snack-restocker's `pick_snack`.
+- `{"command": "set_label", "label": "..."}` changes the text prompt.
+- `{"command": "status"}` returns the current settings.
 
 ## Contract with the ML model service
 
@@ -53,6 +70,13 @@ overlapping requests wait their turn.
 
 ```bash
 ./setup.sh
+.venv/bin/pip install pytest
 .venv/bin/python -m pytest
 ./build.sh   # module.tar.gz
+```
+
+Hot reload onto a machine (adds the module only, no resources):
+
+```bash
+viam module reload-local --part-id <part-id>
 ```

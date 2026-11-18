@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+from dataclasses import dataclass
 from typing import ClassVar, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -458,6 +459,22 @@ class Sam3Segments(Vision, EasyResource):
         extra: Optional[Mapping[str, ValueTypes]] = None,
         timeout: Optional[float] = None,
     ) -> List[PointCloudObject]:
+        results = []
+        for seg in await self._segments():
+            results.append(
+                self._build_point_cloud_object(seg.points, seg.colors, seg.label, seg.ref_frame)
+            )
+            if self._debug:
+                points_raw_world, raw_ref_frame = await self._transform_points_to_world(seg.raw_points)
+                results.append(
+                    self._build_point_cloud_object(
+                        points_raw_world, seg.raw_colors, f"debug_{seg.label}_before_cleaning", raw_ref_frame
+                    )
+                )
+        return results
+
+    async def _segments(self) -> List[_Segment]:
+        """SAM3 instances as cleaned 3D points (world frame when available), in model order."""
         props = await self._camera.get_properties()  # type: ignore[attr-defined]
         intrinsics = props.intrinsic_parameters
         if intrinsics is None:
@@ -471,7 +488,7 @@ class Sam3Segments(Vision, EasyResource):
         dets, masks = await self._prompt_image(color_viam)
         LOGGER.debug(f"SAM3 text prompt {self._label!r} returned {len(dets)} instance(s)")
 
-        results = []
+        segments: List[_Segment] = []
         for det, mask in zip(dets, masks):
             if not np.any(mask):
                 continue
@@ -482,17 +499,40 @@ class Sam3Segments(Vision, EasyResource):
             if len(points) < self._min_points:
                 LOGGER.debug(f"Skipping segment with {len(points)} points (min={self._min_points})")
                 continue
-            label = det.class_name or self._label or "object"
             points, ref_frame = await self._transform_points_to_world(points)
-            results.append(self._build_point_cloud_object(points, colors, label, ref_frame))
-            if self._debug:
-                points_raw_world, raw_ref_frame = await self._transform_points_to_world(points_raw)
-                results.append(
-                    self._build_point_cloud_object(
-                        points_raw_world, colors_raw, f"debug_{label}_before_cleaning", raw_ref_frame
-                    )
+            segments.append(
+                _Segment(
+                    label=det.class_name or self._label or "object",
+                    confidence=det.confidence,
+                    points=points,
+                    colors=colors,
+                    ref_frame=ref_frame,
+                    raw_points=points_raw,
+                    raw_colors=colors_raw,
                 )
-        return results
+            )
+        return segments
+
+    async def _object_summaries(self) -> List[Mapping[str, ValueTypes]]:
+        """Segments as plain dicts, best-first, in the shape snack-restocker's pick_snack reads."""
+        segments = sorted(await self._segments(), key=lambda s: s.confidence, reverse=True)
+        summaries: List[Mapping[str, ValueTypes]] = []
+        for seg in segments:
+            mins = seg.points.min(axis=0)
+            maxs = seg.points.max(axis=0)
+            summaries.append(
+                {
+                    "label": seg.label,
+                    "confidence": float(seg.confidence),
+                    "reference_frame": seg.ref_frame,
+                    "num_points": float(len(seg.points)),
+                    "center_mm": _xyz((mins + maxs) / 2.0),
+                    "dims_mm": _xyz(maxs - mins),
+                    "min_mm": _xyz(mins),
+                    "max_mm": _xyz(maxs),
+                }
+            )
+        return summaries
 
     async def get_detections(
         self,
@@ -581,6 +621,12 @@ class Sam3Segments(Vision, EasyResource):
         **kwargs,
     ) -> Mapping[str, ValueTypes]:
         cmd = command.get("command", "")
+        if cmd == "get_object_point_clouds":
+            try:
+                return {"objects": await self._object_summaries()}
+            except Exception as e:
+                LOGGER.warning(f"get_object_point_clouds command failed: {e}")
+                return {"error": str(e)}
         if cmd == "set_label":
             label = str(command.get("label", "")).strip()
             if not label:
@@ -600,6 +646,21 @@ class Sam3Segments(Vision, EasyResource):
                 "min_points": float(self._min_points),
             }
         return {"error": f"unknown command: {cmd}"}
+
+
+@dataclass
+class _Segment:
+    label: str
+    confidence: float
+    points: np.ndarray
+    colors: np.ndarray
+    ref_frame: str
+    raw_points: np.ndarray
+    raw_colors: np.ndarray
+
+
+def _xyz(v: np.ndarray) -> Mapping[str, ValueTypes]:
+    return {"x": float(v[0]), "y": float(v[1]), "z": float(v[2])}
 
 
 def _to_detection(d: RawDetection) -> Detection:

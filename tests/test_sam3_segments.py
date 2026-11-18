@@ -10,7 +10,7 @@ from viam.components.camera import Camera
 from viam.media.video import CameraMimeType, NamedImage
 from viam.proto.app.robot import ComponentConfig
 from viam.services.mlmodel import MLModel
-from viam.utils import dict_to_struct
+from viam.utils import dict_to_struct, struct_to_dict
 
 from models.sam3_segments import Sam3Segments, masks_from_tensor
 
@@ -169,6 +169,41 @@ def test_point_clouds_from_low_res_masks():
     assert b"POINTS 200" in header  # 10 x 20 px mask
     x, y, z, _ = struct.unpack_from("ffff", body, 0)
     assert z == pytest.approx(DEPTH_MM / 1000.0)
+
+
+def test_get_object_point_clouds_command_matches_pick_snack_format():
+    masks = np.stack([_half_res_mask(10, 20, 10, 30), _half_res_mask(30, 40, 40, 60)])
+    scores = np.array([0.6, 0.9], dtype=np.float32)
+    svc, _, _ = _service({"masks": masks, "scores": scores})
+    resp = asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))
+    # Go clients receive DoCommand results through a protobuf Struct.
+    resp = struct_to_dict(dict_to_struct(resp))
+
+    objects = resp["objects"]
+    assert [round(o["confidence"], 2) for o in objects] == [0.9, 0.6]
+    best = objects[0]
+    assert best["label"] == "cup"
+    assert best["reference_frame"] == "cam"
+    assert best["num_points"] == 200  # 10 x 20 px mask
+    # Mask spans u 40..59, v 30..39 px → X = (u - ppx) * depth / fx, Y = (v - ppy) * depth / fy.
+    k = DEPTH_MM / FX
+    assert best["min_mm"] == pytest.approx({"x": (40 - PPX) * k, "y": (30 - PPY) * k, "z": DEPTH_MM})
+    assert best["max_mm"] == pytest.approx({"x": (59 - PPX) * k, "y": (39 - PPY) * k, "z": DEPTH_MM})
+    assert best["dims_mm"] == pytest.approx({"x": 19 * k, "y": 9 * k, "z": 0})
+    assert best["center_mm"] == pytest.approx(
+        {"x": (49.5 - PPX) * k, "y": (34.5 - PPY) * k, "z": DEPTH_MM}
+    )
+
+
+def test_get_object_point_clouds_command_reports_errors():
+    svc, _, _ = _service({"something_else": np.zeros((1,), dtype=np.float32)})
+    resp = asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))
+    assert "masks" in resp["error"]
+
+
+def test_get_object_point_clouds_command_empty():
+    svc, _, _ = _service(NO_MASKS)
+    assert asyncio.run(svc.do_command({"command": "get_object_point_clouds"})) == {"objects": []}
 
 
 def test_detections_boxes_at_camera_resolution():
