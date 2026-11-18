@@ -6,3 +6,4 @@ if [ ! -d .venv ]; then
     "$PYTHON" -m venv .venv
 fi
 .venv/bin/pip install -q -r requirements.txt
+cp requirements.txt .venv/.requirements.txt
