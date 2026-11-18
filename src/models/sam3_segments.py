@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import io
 import os
-import struct
 from typing import ClassVar, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -148,16 +147,13 @@ def _encode_pcd_binary(points_mm: np.ndarray, colors: np.ndarray) -> bytes:
         f"DATA binary\n"
     ).encode("ascii")
 
-    points_m = points_mm / 1000.0
-    buf = bytearray(n * 16)
-    for i in range(n):
-        x, y, z = points_m[i]
-        r, g, b = int(colors[i, 0]), int(colors[i, 1]), int(colors[i, 2])
-        rgb_int = (r << 16) | (g << 8) | b
-        rgb_float = struct.unpack("f", struct.pack("I", rgb_int))[0]
-        struct.pack_into("ffff", buf, i * 16, float(x), float(y), float(z), rgb_float)
-
-    return header + bytes(buf)
+    points_m = (np.asarray(points_mm, dtype=np.float64) / 1000.0).astype("<f4")
+    c = np.asarray(colors).astype(np.uint32)
+    # PCD packs rgb as the raw bits of a float32, so build rows as uint32 to copy bits exactly.
+    rows = np.empty((n, 4), dtype="<u4")
+    rows[:, :3] = points_m.view("<u4")
+    rows[:, 3] = (c[:, 0] << 16) | (c[:, 1] << 8) | c[:, 2]
+    return header + rows.tobytes()
 
 
 class Sam3Segments(Vision, EasyResource):

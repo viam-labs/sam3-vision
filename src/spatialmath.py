@@ -96,6 +96,9 @@ def _get_lib():
     _lib.free_vector_memory.argtypes = (POINTER(_Vector3),)
     _lib.free_vector_memory.restype = None
 
+    _lib.free_quaternion_components.argtypes = (POINTER(_QuatArray),)
+    _lib.free_quaternion_components.restype = None
+
     return _lib
 
 
@@ -104,8 +107,8 @@ def transform_points_with_pose(o_x: float, o_y: float, o_z: float, theta_deg: fl
                                 points: np.ndarray) -> np.ndarray:
     """Transform 3D points using a Viam Pose (OrientationVector + translation).
 
-    This uses Viam's rust utils to perform the exact same rotation as the Go RDK:
-    OV → quaternion → rotate each point → add translation.
+    Viam's rust utils convert OV → quaternion exactly as the Go RDK does; the
+    rotation is then applied to all points at once as a matrix, plus translation.
 
     Matches: rdk/spatialmath Compose(offset_dq, point_dq).Point()
 
@@ -124,13 +127,15 @@ def transform_points_with_pose(o_x: float, o_y: float, o_z: float, theta_deg: fl
     ov = lib.new_orientation_vector(c_double(o_x), c_double(o_y), c_double(o_z), c_double(theta_rad))
     q = lib.quaternion_from_orientation_vector(ov)
     lib.free_orientation_vector_memory(ov)
-
-    result = np.empty_like(points)
-    for i in range(len(points)):
-        v = _Vector3(float(points[i, 0]), float(points[i, 1]), float(points[i, 2]))
-        rv = lib.quaternion_rotate_vector(q, ctypes.byref(v))
-        result[i] = [rv.contents.x + tx, rv.contents.y + ty, rv.contents.z + tz]
-        lib.free_vector_memory(rv)
-
+    comps = lib.quaternion_get_components(q)
+    w, x, y, z = comps.contents.real, comps.contents.i, comps.contents.j, comps.contents.k
+    lib.free_quaternion_components(comps)
     lib.free_quaternion_memory(q)
-    return result
+
+    rotation = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+    points = np.asarray(points, dtype=np.float64)
+    return points @ rotation.T + np.array([tx, ty, tz])
