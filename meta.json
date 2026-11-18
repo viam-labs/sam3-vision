@@ -1,0 +1,20 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam:sam3-vision",
+  "visibility": "private",
+  "url": "https://github.com/viam-labs/sam3-vision",
+  "description": "Vision service that sends camera frames and a text prompt to a remote SAM3 ML model service and turns the returned masks into detections and 3D point clouds.",
+  "models": [
+    {
+      "api": "rdk:service:vision",
+      "model": "viam:sam3-vision:sam3-segments"
+    }
+  ],
+  "entrypoint": "run.sh",
+  "build": {
+    "setup": "./setup.sh",
+    "build": "./build.sh",
+    "path": "module.tar.gz",
+    "arch": ["linux/amd64", "linux/arm64", "darwin/arm64"]
+  }
+}
