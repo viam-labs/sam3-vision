@@ -9,6 +9,7 @@ the returned masks into detections and 3D point clouds.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 from typing import ClassVar, List, Mapping, Optional, Sequence, Tuple
@@ -48,9 +49,9 @@ LOGGER = getLogger(__name__)
 MAX_DEPTH_MM = 20000
 
 DEFAULT_IMAGE_TENSOR = "image"
+DEFAULT_PROMPT_TENSOR = "prompt"
 DEFAULT_MASK_TENSOR = "masks"
 SCORE_TENSOR = "scores"
-PROMPT_EXTRA_KEY = "prompt"
 
 
 async def _connect_to_machine() -> Optional[RobotClient]:
@@ -104,17 +105,24 @@ def _depth_image_to_numpy(image: ViamImage) -> np.ndarray:
     return np.array(pil, dtype=np.float64)
 
 
-def masks_from_tensor(
-    tensor: np.ndarray, image_hw: Tuple[int, int], threshold: float
-) -> List[np.ndarray]:
-    """Split an ML model mask tensor into per-instance boolean masks at camera resolution.
-
-    Accepts any shape whose last two dims are (h, w), e.g. [N, h, w], [1, N, h, w], [N, 1, h, w].
-    """
+def _stack_masks(tensor: np.ndarray) -> np.ndarray:
+    """Reshape any [..., h, w] mask tensor (e.g. [N, h, w], [1, N, h, w]) to [N, h, w]."""
     arr = np.asarray(tensor)
     if arr.ndim < 2 or arr.size == 0:
-        return []
-    arr = arr.reshape(-1, arr.shape[-2], arr.shape[-1])
+        return np.empty((0, 0, 0), dtype=arr.dtype)
+    return arr.reshape(-1, arr.shape[-2], arr.shape[-1])
+
+
+def masks_from_tensor(
+    tensor: np.ndarray,
+    image_hw: Tuple[int, int],
+    threshold: float,
+    keep: Optional[np.ndarray] = None,
+) -> List[np.ndarray]:
+    """Per-instance boolean masks at camera resolution, for only the `keep` indices if given."""
+    arr = _stack_masks(tensor)
+    if keep is not None:
+        arr = arr[keep]
     height, width = image_hw
     masks: List[np.ndarray] = []
     for m in arr:
@@ -169,7 +177,9 @@ class Sam3Segments(Vision, EasyResource):
     _mlmodel_name: str = ""
     _label: str = ""
     _image_tensor_name: str = DEFAULT_IMAGE_TENSOR
+    _prompt_tensor_name: str = DEFAULT_PROMPT_TENSOR
     _mask_tensor_name: str = DEFAULT_MASK_TENSOR
+    _infer_lock: asyncio.Lock
     _mask_threshold: float = 0.5
     _confidence_threshold: float = 0.5
     _depth_threshold_mm: int = 0
@@ -185,6 +195,7 @@ class Sam3Segments(Vision, EasyResource):
     ) -> Self:
         instance = super().new(config, dependencies)
         instance._robot_client = None
+        instance._infer_lock = asyncio.Lock()
         instance._apply_config(config, dependencies)
         return instance
 
@@ -223,6 +234,7 @@ class Sam3Segments(Vision, EasyResource):
         )
 
         self._image_tensor_name = string("image_tensor_name", DEFAULT_IMAGE_TENSOR)
+        self._prompt_tensor_name = string("prompt_tensor_name", DEFAULT_PROMPT_TENSOR)
         self._mask_tensor_name = string("mask_tensor_name", DEFAULT_MASK_TENSOR)
         self._mask_threshold = num("mask_threshold", 0.5)
         self._confidence_threshold = num("confidence_threshold", 0.5)
@@ -261,22 +273,32 @@ class Sam3Segments(Vision, EasyResource):
     ) -> Tuple[List[RawDetection], List[np.ndarray]]:
         """Run SAM3 remotely. Returns (detections, binary masks aligned 1:1)."""
         label = self._label
-        outputs = await self._mlmodel.infer(  # type: ignore[attr-defined]
-            {self._image_tensor_name: np.ascontiguousarray(color_np[None, ...], dtype=np.uint8)},
-            extra={PROMPT_EXTRA_KEY: label},
-        )
+        inputs = {
+            self._image_tensor_name: np.ascontiguousarray(color_np, dtype=np.uint8),
+            self._prompt_tensor_name: np.frombuffer(label.encode("utf-8"), dtype=np.uint8),
+        }
+        # The SAM3 ML model service rejects concurrent Infer calls instead of queueing them.
+        async with self._infer_lock:
+            outputs = await self._mlmodel.infer(inputs)  # type: ignore[attr-defined]
         if self._mask_tensor_name not in outputs:
             raise ValueError(
                 f"ML model {self._mlmodel_name!r} returned no {self._mask_tensor_name!r} tensor; "
                 f"got {sorted(outputs)}"
             )
-        masks = masks_from_tensor(
-            outputs[self._mask_tensor_name], color_np.shape[:2], self._mask_threshold
-        )
+        raw_masks = outputs[self._mask_tensor_name]
+        keep = None
         scores = outputs.get(SCORE_TENSOR)
         if scores is not None:
             scores = np.asarray(scores).reshape(-1)
-        return detections_from_masks(masks, scores, label, self._confidence_threshold)
+            count = len(_stack_masks(raw_masks))
+            if len(scores) != count:
+                raise ValueError(
+                    f"ML model {self._mlmodel_name!r} returned {count} masks but {len(scores)} scores"
+                )
+            keep = np.flatnonzero(scores >= self._confidence_threshold)
+            scores = scores[keep]
+        masks = masks_from_tensor(raw_masks, color_np.shape[:2], self._mask_threshold, keep)
+        return detections_from_masks(masks, scores, label)
 
     async def _maybe_filter_with_upstream(
         self, image: ViamImage, dets: List[RawDetection], masks: List[np.ndarray]

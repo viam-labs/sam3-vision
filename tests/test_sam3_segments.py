@@ -46,13 +46,29 @@ class FakeCamera:
 
 
 class FakeMLModel:
+    """Mirrors the SAM3 ML model service: rejects a call while another is running."""
+
     def __init__(self, outputs):
         self.outputs = outputs
         self.calls = []
+        self.active = 0
 
     async def infer(self, input_tensors, *, extra=None, timeout=None):
-        self.calls.append((input_tensors, extra))
-        return self.outputs
+        if self.active:
+            raise RuntimeError("busy")
+        self.active += 1
+        try:
+            self.calls.append((input_tensors, extra))
+            await asyncio.sleep(0)
+            return self.outputs
+        finally:
+            self.active -= 1
+
+
+def _prompt(inputs) -> str:
+    assert inputs["prompt"].dtype == np.uint8
+    assert inputs["prompt"].ndim == 1
+    return inputs["prompt"].tobytes().decode("utf-8")
 
 
 def _frame():
@@ -80,27 +96,59 @@ def _service(ml_outputs, **attrs):
 
 
 def _half_res_mask(y0, y1, x0, x1):
-    """Mask at half the camera resolution, as a remote model might return it."""
-    m = np.zeros((H // 2, W // 2), dtype=np.float32)
-    m[y0 // 2 : y1 // 2, x0 // 2 : x1 // 2] = 1.0
+    """Binary uint8 mask at half the camera resolution, as the SAM3 ML model service returns it."""
+    m = np.zeros((H // 2, W // 2), dtype=np.uint8)
+    m[y0 // 2 : y1 // 2, x0 // 2 : x1 // 2] = 1
     return m
 
 
-def test_sends_camera_frame_and_prompt():
-    svc, ml, color = _service({"masks": np.zeros((0, H, W), dtype=np.uint8)})
+NO_MASKS = {"masks": np.zeros((0, H // 2, W // 2), dtype=np.uint8), "scores": np.zeros(0, np.float32)}
+
+
+def test_sends_camera_frame_and_prompt_tensors():
+    svc, ml, color = _service(NO_MASKS)
     asyncio.run(svc.get_detections_from_camera("cam"))
     (inputs, extra), = ml.calls
-    assert extra == {"prompt": "cup"}
+    assert extra is None
     assert inputs["image"].dtype == np.uint8
-    assert inputs["image"].shape == (1, H, W, 3)
-    np.testing.assert_array_equal(inputs["image"][0], color)
+    assert inputs["image"].shape == (H, W, 3)
+    np.testing.assert_array_equal(inputs["image"], color)
+    assert _prompt(inputs) == "cup"
 
 
 def test_set_label_changes_prompt():
-    svc, ml, _ = _service({"masks": np.zeros((0, H, W), dtype=np.uint8)})
-    asyncio.run(svc.do_command({"command": "set_label", "label": "bowl"}))
+    svc, ml, _ = _service(NO_MASKS)
+    asyncio.run(svc.do_command({"command": "set_label", "label": "verre à vin"}))
     asyncio.run(svc.get_detections_from_camera("cam"))
-    assert ml.calls[-1][1] == {"prompt": "bowl"}
+    assert _prompt(ml.calls[-1][0]) == "verre à vin"
+
+
+def test_concurrent_calls_do_not_hit_busy_model():
+    svc, ml, _ = _service(NO_MASKS)
+
+    async def run():
+        await asyncio.gather(*(svc.get_detections_from_camera("cam") for _ in range(4)))
+
+    asyncio.run(run())
+    assert len(ml.calls) == 4
+
+
+def test_low_score_proposals_dropped_from_many():
+    masks = np.stack([_half_res_mask(10, 20, 10, 30)] * 200)
+    scores = np.full(200, 0.1, dtype=np.float32)
+    scores[137] = 0.8
+    svc, _, _ = _service({"masks": masks, "scores": scores})
+    dets = asyncio.run(svc.get_detections_from_camera("cam"))
+    assert [round(d.confidence, 2) for d in dets] == [0.8]
+    assert (dets[0].x_min, dets[0].y_min, dets[0].x_max, dets[0].y_max) == (10, 10, 29, 19)
+
+
+def test_mask_and_score_count_mismatch_is_an_error():
+    svc, _, _ = _service(
+        {"masks": np.stack([_half_res_mask(10, 20, 10, 30)] * 3), "scores": np.ones(2, np.float32)}
+    )
+    with pytest.raises(ValueError, match="3 masks but 2 scores"):
+        asyncio.run(svc.get_detections_from_camera("cam"))
 
 
 def test_point_clouds_from_low_res_masks():
