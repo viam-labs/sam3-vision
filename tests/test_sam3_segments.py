@@ -203,7 +203,80 @@ def test_get_object_point_clouds_command_reports_errors():
 
 def test_get_object_point_clouds_command_empty():
     svc, _, _ = _service(NO_MASKS)
-    assert asyncio.run(svc.do_command({"command": "get_object_point_clouds"})) == {"objects": []}
+    resp = asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))
+    assert resp["objects"] == []
+    assert resp["snapshot_id"]
+
+
+def _two_bag_snapshot():
+    masks = np.stack([_half_res_mask(10, 20, 10, 30), _half_res_mask(30, 40, 40, 60)])
+    svc, _, color = _service({"masks": masks, "scores": np.array([0.6, 0.9], dtype=np.float32)})
+    resp = struct_to_dict(dict_to_struct(asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))))
+    return svc, resp, color
+
+
+def test_get_object_point_clouds_command_includes_pixel_boxes():
+    _, resp, _ = _two_bag_snapshot()
+    assert (resp["image_width"], resp["image_height"]) == (W, H)
+    # Best-first: the 0.9 bag (u 40..59, v 30..39) comes before the 0.6 bag.
+    assert resp["objects"][0]["bbox_px"] == {"x_min": 40, "y_min": 30, "x_max": 59, "y_max": 39}
+    assert resp["objects"][1]["bbox_px"] == {"x_min": 10, "y_min": 10, "x_max": 29, "y_max": 19}
+
+
+def _decode(resp):
+    import base64
+
+    return np.array(PILImage.open(io.BytesIO(base64.b64decode(resp["image_jpeg_b64"]))).convert("RGB"))
+
+
+def test_render_pick_highlights_the_target_segment():
+    svc, resp, color = _two_bag_snapshot()
+    out = asyncio.run(
+        svc.do_command(
+            {
+                "command": "render_pick",
+                "snapshot_id": resp["snapshot_id"],
+                "target": 1,
+                "notes": {"0": "unreachable", "1": "TARGET"},
+            }
+        )
+    )
+    img = _decode(out)
+    assert img.shape == (H, W, 3)
+    # Inside the target (objects[1]: u 10..29, v 10..19) the frame is tinted green on average
+    # (its label partly covers it in this tiny test image).
+    target_green = img[10:20, 10:30, 1].astype(int).mean()
+    assert target_green > color[10:20, 10:30, 1].astype(int).mean() + 60
+    # Inside the other bag, away from its outline and label, the frame is unchanged.
+    other_px = img[36, 50].astype(int)
+    assert np.abs(other_px - color[36, 50].astype(int)).max() < 30
+
+
+def test_render_pick_without_target():
+    svc, resp, _ = _two_bag_snapshot()
+    out = asyncio.run(
+        svc.do_command(
+            {"command": "render_pick", "snapshot_id": resp["snapshot_id"], "title": "pick_snack failed"}
+        )
+    )
+    assert _decode(out).shape == (H, W, 3)
+
+
+def test_render_pick_unknown_snapshot():
+    svc, _, _ = _service(NO_MASKS)
+    out = asyncio.run(svc.do_command({"command": "render_pick", "snapshot_id": "nope"}))
+    assert "snapshot_id" in out["error"]
+
+
+def test_old_snapshots_expire():
+    svc, _, _ = _service(NO_MASKS)
+    ids = [
+        asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))["snapshot_id"]
+        for _ in range(10)
+    ]
+    first = asyncio.run(svc.do_command({"command": "render_pick", "snapshot_id": ids[0]}))
+    last = asyncio.run(svc.do_command({"command": "render_pick", "snapshot_id": ids[-1]}))
+    assert "error" in first and "image_jpeg_b64" in last
 
 
 def test_detections_boxes_at_camera_resolution():

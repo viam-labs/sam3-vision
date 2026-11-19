@@ -10,8 +10,11 @@ the returned masks into detections and 3D point clouds.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import os
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import ClassVar, List, Mapping, Optional, Sequence, Tuple
 
@@ -43,6 +46,7 @@ from viam.services.vision import CaptureAllResult, Vision
 from viam.utils import ValueTypes
 
 from models.boxes import RawDetection, detections_from_masks
+from models.pick_render import parse_notes, render_pick
 from spatialmath import transform_points_with_pose
 
 LOGGER = getLogger(__name__)
@@ -53,6 +57,7 @@ DEFAULT_IMAGE_TENSOR = "image"
 DEFAULT_PROMPT_TENSOR = "prompt"
 DEFAULT_MASK_TENSOR = "masks"
 SCORE_TENSOR = "scores"
+MAX_SNAPSHOTS = 8
 
 
 async def _connect_to_machine() -> Optional[RobotClient]:
@@ -181,6 +186,7 @@ class Sam3Segments(Vision, EasyResource):
     _prompt_tensor_name: str = DEFAULT_PROMPT_TENSOR
     _mask_tensor_name: str = DEFAULT_MASK_TENSOR
     _infer_lock: asyncio.Lock
+    _snapshots: "OrderedDict[str, Tuple[np.ndarray, List[_Segment]]]"
     _mask_threshold: float = 0.5
     _confidence_threshold: float = 0.5
     _depth_threshold_mm: int = 0
@@ -197,6 +203,7 @@ class Sam3Segments(Vision, EasyResource):
         instance = super().new(config, dependencies)
         instance._robot_client = None
         instance._infer_lock = asyncio.Lock()
+        instance._snapshots = OrderedDict()
         instance._apply_config(config, dependencies)
         return instance
 
@@ -474,7 +481,12 @@ class Sam3Segments(Vision, EasyResource):
         return results
 
     async def _segments(self) -> List[_Segment]:
-        """SAM3 instances as cleaned 3D points (world frame when available), in model order."""
+        segments, _ = await self._segments_with_frame()
+        return segments
+
+    async def _segments_with_frame(self) -> Tuple[List[_Segment], np.ndarray]:
+        """SAM3 instances as cleaned 3D points (world frame when available), in model order,
+        plus the color frame they came from."""
         props = await self._camera.get_properties()  # type: ignore[attr-defined]
         intrinsics = props.intrinsic_parameters
         if intrinsics is None:
@@ -509,17 +521,29 @@ class Sam3Segments(Vision, EasyResource):
                     ref_frame=ref_frame,
                     raw_points=points_raw,
                     raw_colors=colors_raw,
+                    mask=mask,
+                    bbox_px=(det.x_min, det.y_min, det.x_max, det.y_max),
                 )
             )
-        return segments
+        return segments, color_np
 
-    async def _object_summaries(self) -> List[Mapping[str, ValueTypes]]:
-        """Segments as plain dicts, best-first, in the shape snack-restocker's pick_snack reads."""
-        segments = sorted(await self._segments(), key=lambda s: s.confidence, reverse=True)
+    async def _object_summaries(self) -> Mapping[str, ValueTypes]:
+        """Segments as plain dicts, best-first, in the shape snack-restocker's pick_snack reads.
+
+        Also keeps the frame and masks under `snapshot_id` so `render_pick` can draw the chosen one.
+        """
+        segments, color_np = await self._segments_with_frame()
+        segments.sort(key=lambda s: s.confidence, reverse=True)
+        snapshot_id = uuid.uuid4().hex
+        self._snapshots[snapshot_id] = (color_np, segments)
+        while len(self._snapshots) > MAX_SNAPSHOTS:
+            self._snapshots.popitem(last=False)
+
         summaries: List[Mapping[str, ValueTypes]] = []
         for seg in segments:
             mins = seg.points.min(axis=0)
             maxs = seg.points.max(axis=0)
+            x_min, y_min, x_max, y_max = seg.bbox_px
             summaries.append(
                 {
                     "label": seg.label,
@@ -530,9 +554,46 @@ class Sam3Segments(Vision, EasyResource):
                     "dims_mm": _xyz(maxs - mins),
                     "min_mm": _xyz(mins),
                     "max_mm": _xyz(maxs),
+                    "bbox_px": {
+                        "x_min": float(x_min), "y_min": float(y_min),
+                        "x_max": float(x_max), "y_max": float(y_max),
+                    },
                 }
             )
-        return summaries
+        height, width = color_np.shape[:2]
+        return {
+            "objects": summaries,
+            "snapshot_id": snapshot_id,
+            "image_width": float(width),
+            "image_height": float(height),
+        }
+
+    def _render_pick(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        snapshot_id = str(command.get("snapshot_id", ""))
+        if snapshot_id not in self._snapshots:
+            return {"error": f"unknown or expired snapshot_id {snapshot_id!r}"}
+        color_np, segments = self._snapshots[snapshot_id]
+        target = command.get("target")
+        target_index = int(target) if isinstance(target, (int, float)) and target >= 0 else None
+        notes = parse_notes(command.get("notes"), len(segments))  # type: ignore[arg-type]
+        labels = [
+            f"{seg.confidence:.2f} {note}".strip() for seg, note in zip(segments, notes)
+        ]
+        failed_raw = command.get("failed") or []
+        failed = {int(i) for i in failed_raw if isinstance(i, (int, float))}  # type: ignore[union-attr]
+        min_confidence = command.get("min_confidence", 0.0)
+        min_confidence = float(min_confidence) if isinstance(min_confidence, (int, float)) else 0.0
+        jpeg = render_pick(
+            color_np,
+            [seg.mask for seg in segments],
+            [seg.bbox_px for seg in segments],
+            labels,
+            target_index,
+            title=str(command.get("title", "")),
+            failed=failed,
+            visible=[seg.confidence >= min_confidence for seg in segments],
+        )
+        return {"image_jpeg_b64": base64.b64encode(jpeg).decode("ascii")}
 
     async def get_detections(
         self,
@@ -623,9 +684,15 @@ class Sam3Segments(Vision, EasyResource):
         cmd = command.get("command", "")
         if cmd == "get_object_point_clouds":
             try:
-                return {"objects": await self._object_summaries()}
+                return await self._object_summaries()
             except Exception as e:
                 LOGGER.warning(f"get_object_point_clouds command failed: {e}")
+                return {"error": str(e)}
+        if cmd == "render_pick":
+            try:
+                return self._render_pick(command)
+            except Exception as e:
+                LOGGER.warning(f"render_pick command failed: {e}")
                 return {"error": str(e)}
         if cmd == "set_label":
             label = str(command.get("label", "")).strip()
@@ -657,6 +724,8 @@ class _Segment:
     ref_frame: str
     raw_points: np.ndarray
     raw_colors: np.ndarray
+    mask: np.ndarray
+    bbox_px: Tuple[int, int, int, int]
 
 
 def _xyz(v: np.ndarray) -> Mapping[str, ValueTypes]:

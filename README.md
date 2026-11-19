@@ -45,6 +45,12 @@ The camera's `GetImages` must return a color image and a depth image (named with
   `label`, `confidence`, `reference_frame`, `num_points`, and `center_mm` / `dims_mm` / `min_mm` / `max_mm`
   as `{x, y, z}` (axis-aligned box in `reference_frame`, `world` when the frame system is available).
   Failures return `{"error": "..."}`. Used by snack-restocker's `pick_snack`.
+  The response also has `snapshot_id`, `image_width`, `image_height`, and a pixel `bbox_px` per object;
+  the frame and masks are kept in memory under `snapshot_id` (last 8).
+- `{"command": "render_pick", "snapshot_id": "...", "target": i, "failed": [i, ...], "min_confidence": 0.75,
+  "notes": {"<i>": "text"}, "title": "..."}` returns `{"image_jpeg_b64": "..."}`: that frame with object `i`
+  (by index in `objects`) filled green, `failed` ones outlined orange, the rest outlined gray, and objects
+  below `min_confidence` hidden unless targeted or failed.
 - `{"command": "set_label", "label": "..."}` changes the text prompt.
 - `{"command": "status"}` returns the current settings.
 
