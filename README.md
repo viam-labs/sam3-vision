@@ -37,20 +37,28 @@ The camera's `GetImages` must return a color image and a depth image (named with
 | `min_points` | `50` | Skip segments with fewer points |
 | `detector_name` | — | Optional vision service whose boxes filter SAM3 results |
 | `highlighting_on`, `highlight_color` | off, green | Mask overlay on `capture_all_from_camera` images |
-| `debug` | `false` | Also return each cloud before cleaning |
+| `debug` | `false` | Also return each cloud before cleaning from `GetObjectPointClouds` |
+
+## GetDetections3D
+
+Returns one detection per segment, best confidence first. Each has:
+
+- `transforms[0]`: root frame `<service>/object-<i>`, posed at the segment's axis-aligned bounding-box center in
+  `world` (the camera frame when the frame system is unavailable), carrying that box as its geometry.
+- `transforms[1]`: `<root>/points`, at the root's origin, carrying the segment's points relative to the root.
+- `classifications`: the label and SAM3 confidence.
+- `metadata`: `snapshot_id` and the pixel `bbox_px`.
+
+The frame and masks are kept in memory under `snapshot_id` (last 8) for `render_pick`. Pass
+`extra: {"snapshot_id": "..."}` to choose the id, so it is known even when nothing is detected.
+Used by snack-restocker's `pick_snack`.
 
 ## DoCommand
 
-- `{"command": "get_object_point_clouds"}` returns `{"objects": [...]}`, best confidence first. Each object has
-  `label`, `confidence`, `reference_frame`, `num_points`, and `center_mm` / `dims_mm` / `min_mm` / `max_mm`
-  as `{x, y, z}` (axis-aligned box in `reference_frame`, `world` when the frame system is available).
-  Failures return `{"error": "..."}`. Used by snack-restocker's `pick_snack`.
-  The response also has `snapshot_id`, `image_width`, `image_height`, and a pixel `bbox_px` per object;
-  the frame and masks are kept in memory under `snapshot_id` (last 8).
 - `{"command": "render_pick", "snapshot_id": "...", "target": i, "failed": [i, ...], "min_confidence": 0.75,
-  "notes": {"<i>": "text"}, "title": "..."}` returns `{"image_jpeg_b64": "..."}`: that frame with object `i`
-  (by index in `objects`) filled green, `failed` ones outlined orange, the rest outlined gray, and objects
-  below `min_confidence` hidden unless targeted or failed.
+  "notes": {"<i>": "text"}, "title": "..."}` returns `{"image_jpeg_b64": "..."}`: that frame with detection `i`
+  (by index in the `GetDetections3D` response) filled green, `failed` ones outlined orange, the rest outlined
+  gray, and segments below `min_confidence` hidden unless targeted or failed.
 - `{"command": "set_label", "label": "..."}` changes the text prompt.
 - `{"command": "status"}` returns the current settings.
 

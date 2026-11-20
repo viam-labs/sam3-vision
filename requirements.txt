@@ -1,4 +1,4 @@
-viam-sdk[mlmodel]==0.83.0
+viam-sdk[mlmodel]==0.85.2
 typing-extensions
 numpy>=1.26,<2
 pillow
