@@ -171,56 +171,66 @@ def test_point_clouds_from_low_res_masks():
     assert z == pytest.approx(DEPTH_MM / 1000.0)
 
 
-def test_get_object_point_clouds_command_matches_pick_snack_format():
+def _pcd_points_mm(pcd: bytes) -> np.ndarray:
+    header, _, body = pcd.partition(b"DATA binary\n")
+    n = int(header.split(b"POINTS ")[1].split(b"\n")[0])
+    return np.frombuffer(body, dtype="<f4").reshape(n, 4)[:, :3].astype(np.float64) * 1000.0
+
+
+def test_detections_3d_best_first_with_box_and_points():
     masks = np.stack([_half_res_mask(10, 20, 10, 30), _half_res_mask(30, 40, 40, 60)])
     scores = np.array([0.6, 0.9], dtype=np.float32)
     svc, _, _ = _service({"masks": masks, "scores": scores})
-    resp = asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))
-    # Go clients receive DoCommand results through a protobuf Struct.
-    resp = struct_to_dict(dict_to_struct(resp))
+    dets = asyncio.run(svc.get_detections_3d("cam"))
 
-    objects = resp["objects"]
-    assert [round(o["confidence"], 2) for o in objects] == [0.9, 0.6]
-    best = objects[0]
-    assert best["label"] == "cup"
-    assert best["reference_frame"] == "cam"
-    assert best["num_points"] == 200  # 10 x 20 px mask
+    assert [round(d.classifications[0].confidence, 2) for d in dets] == [0.9, 0.6]
+    best = dets[0]
+    assert best.classifications[0].class_name == "cup"
+    root, points = best.transforms
+    assert root.reference_frame == "seg/object-0"
+    # No frame system in tests, so the root hangs off the camera frame.
+    assert root.pose_in_observer_frame.reference_frame == "cam"
     # Mask spans u 40..59, v 30..39 px → X = (u - ppx) * depth / fx, Y = (v - ppy) * depth / fy.
     k = DEPTH_MM / FX
-    assert best["min_mm"] == pytest.approx({"x": (40 - PPX) * k, "y": (30 - PPY) * k, "z": DEPTH_MM})
-    assert best["max_mm"] == pytest.approx({"x": (59 - PPX) * k, "y": (39 - PPY) * k, "z": DEPTH_MM})
-    assert best["dims_mm"] == pytest.approx({"x": 19 * k, "y": 9 * k, "z": 0})
-    assert best["center_mm"] == pytest.approx(
-        {"x": (49.5 - PPX) * k, "y": (34.5 - PPY) * k, "z": DEPTH_MM}
-    )
+    center = np.array([(49.5 - PPX) * k, (34.5 - PPY) * k, DEPTH_MM])
+    pose = root.pose_in_observer_frame.pose
+    np.testing.assert_allclose([pose.x, pose.y, pose.z], center)
+    dims = root.physical_object.box.dims_mm
+    np.testing.assert_allclose([dims.x, dims.y, dims.z], [19 * k, 9 * k, 0])
+
+    assert points.reference_frame == "seg/object-0/points"
+    assert points.pose_in_observer_frame.reference_frame == "seg/object-0"
+    pts = _pcd_points_mm(points.physical_object.pointcloud.point_cloud)
+    assert len(pts) == 200  # 10 x 20 px mask
+    # Points are relative to the root, so adding its pose gives the camera-frame points back.
+    world = pts + center
+    np.testing.assert_allclose(world.min(axis=0), [(40 - PPX) * k, (30 - PPY) * k, DEPTH_MM], atol=1e-3)
+    np.testing.assert_allclose(world.max(axis=0), [(59 - PPX) * k, (39 - PPY) * k, DEPTH_MM], atol=1e-3)
+
+    meta = struct_to_dict(best.metadata)
+    assert meta["snapshot_id"]
+    assert meta["bbox_px"] == {"x_min": 40, "y_min": 30, "x_max": 59, "y_max": 39}
+    assert struct_to_dict(dets[1].metadata)["bbox_px"] == {"x_min": 10, "y_min": 10, "x_max": 29, "y_max": 19}
 
 
-def test_get_object_point_clouds_command_reports_errors():
+def test_detections_3d_reports_model_errors():
     svc, _, _ = _service({"something_else": np.zeros((1,), dtype=np.float32)})
-    resp = asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))
-    assert "masks" in resp["error"]
+    with pytest.raises(ValueError, match="masks"):
+        asyncio.run(svc.get_detections_3d("cam"))
 
 
-def test_get_object_point_clouds_command_empty():
+def test_detections_3d_empty_still_keeps_requested_snapshot():
     svc, _, _ = _service(NO_MASKS)
-    resp = asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))
-    assert resp["objects"] == []
-    assert resp["snapshot_id"]
+    assert asyncio.run(svc.get_detections_3d("cam", extra={"snapshot_id": "pick-1"})) == []
+    out = asyncio.run(svc.do_command({"command": "render_pick", "snapshot_id": "pick-1"}))
+    assert out["image_jpeg_b64"]
 
 
 def _two_bag_snapshot():
     masks = np.stack([_half_res_mask(10, 20, 10, 30), _half_res_mask(30, 40, 40, 60)])
     svc, _, color = _service({"masks": masks, "scores": np.array([0.6, 0.9], dtype=np.float32)})
-    resp = struct_to_dict(dict_to_struct(asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))))
-    return svc, resp, color
-
-
-def test_get_object_point_clouds_command_includes_pixel_boxes():
-    _, resp, _ = _two_bag_snapshot()
-    assert (resp["image_width"], resp["image_height"]) == (W, H)
-    # Best-first: the 0.9 bag (u 40..59, v 30..39) comes before the 0.6 bag.
-    assert resp["objects"][0]["bbox_px"] == {"x_min": 40, "y_min": 30, "x_max": 59, "y_max": 39}
-    assert resp["objects"][1]["bbox_px"] == {"x_min": 10, "y_min": 10, "x_max": 29, "y_max": 19}
+    dets = asyncio.run(svc.get_detections_3d("cam"))
+    return svc, struct_to_dict(dets[0].metadata)["snapshot_id"], color
 
 
 def _decode(resp):
@@ -230,12 +240,12 @@ def _decode(resp):
 
 
 def test_render_pick_highlights_the_target_segment():
-    svc, resp, color = _two_bag_snapshot()
+    svc, snapshot_id, color = _two_bag_snapshot()
     out = asyncio.run(
         svc.do_command(
             {
                 "command": "render_pick",
-                "snapshot_id": resp["snapshot_id"],
+                "snapshot_id": snapshot_id,
                 "target": 1,
                 "notes": {"0": "unreachable", "1": "TARGET"},
             }
@@ -243,7 +253,7 @@ def test_render_pick_highlights_the_target_segment():
     )
     img = _decode(out)
     assert img.shape == (H, W, 3)
-    # Inside the target (objects[1]: u 10..29, v 10..19) the frame is tinted green on average
+    # Inside the target (detection 1: u 10..29, v 10..19) the frame is tinted green on average
     # (its label partly covers it in this tiny test image).
     target_green = img[10:20, 10:30, 1].astype(int).mean()
     assert target_green > color[10:20, 10:30, 1].astype(int).mean() + 60
@@ -253,11 +263,9 @@ def test_render_pick_highlights_the_target_segment():
 
 
 def test_render_pick_without_target():
-    svc, resp, _ = _two_bag_snapshot()
+    svc, snapshot_id, _ = _two_bag_snapshot()
     out = asyncio.run(
-        svc.do_command(
-            {"command": "render_pick", "snapshot_id": resp["snapshot_id"], "title": "pick_snack failed"}
-        )
+        svc.do_command({"command": "render_pick", "snapshot_id": snapshot_id, "title": "pick_snack failed"})
     )
     assert _decode(out).shape == (H, W, 3)
 
@@ -270,10 +278,9 @@ def test_render_pick_unknown_snapshot():
 
 def test_old_snapshots_expire():
     svc, _, _ = _service(NO_MASKS)
-    ids = [
-        asyncio.run(svc.do_command({"command": "get_object_point_clouds"}))["snapshot_id"]
-        for _ in range(10)
-    ]
+    ids = [f"pick-{i}" for i in range(10)]
+    for i in ids:
+        asyncio.run(svc.get_detections_3d("cam", extra={"snapshot_id": i}))
     first = asyncio.run(svc.do_command({"command": "render_pick", "snapshot_id": ids[0]}))
     last = asyncio.run(svc.do_command({"command": "render_pick", "snapshot_id": ids[-1]}))
     assert "error" in first and "image_jpeg_b64" in last

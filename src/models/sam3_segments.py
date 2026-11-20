@@ -28,14 +28,16 @@ from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import (
     GeometriesInFrame,
     Geometry,
+    PointCloud,
     PointCloudObject,
     Pose,
     PoseInFrame,
     RectangularPrism,
     ResourceName,
+    Transform,
     Vector3,
 )
-from viam.proto.service.vision import Classification, Detection, GetPropertiesResponse
+from viam.proto.service.vision import Classification, Detection, Detection3D, GetPropertiesResponse
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
@@ -43,7 +45,7 @@ from viam.robot.client import RobotClient
 from viam.rpc.dial import DialOptions
 from viam.services.mlmodel import MLModel
 from viam.services.vision import CaptureAllResult, Vision
-from viam.utils import ValueTypes
+from viam.utils import ValueTypes, dict_to_struct
 
 from models.boxes import RawDetection, detections_from_masks
 from models.pick_render import parse_notes, render_pick
@@ -527,46 +529,29 @@ class Sam3Segments(Vision, EasyResource):
             )
         return segments, color_np
 
-    async def _object_summaries(self) -> Mapping[str, ValueTypes]:
-        """Segments as plain dicts, best-first, in the shape snack-restocker's pick_snack reads.
+    async def get_detections_3d(
+        self,
+        camera_name: str,
+        *,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> List[Detection3D]:
+        """Segments best-first, each a root frame carrying its bounding box plus a `<root>/points` child.
 
-        Also keeps the frame and masks under `snapshot_id` so `render_pick` can draw the chosen one.
+        Keeps the frame and masks under `extra["snapshot_id"]` (or a new id) so `render_pick` can draw
+        the pick; the id is also in each detection's metadata.
         """
         segments, color_np = await self._segments_with_frame()
         segments.sort(key=lambda s: s.confidence, reverse=True)
-        snapshot_id = uuid.uuid4().hex
+        snapshot_id = str((extra or {}).get("snapshot_id") or uuid.uuid4().hex)
         self._snapshots[snapshot_id] = (color_np, segments)
+        self._snapshots.move_to_end(snapshot_id)
         while len(self._snapshots) > MAX_SNAPSHOTS:
             self._snapshots.popitem(last=False)
-
-        summaries: List[Mapping[str, ValueTypes]] = []
-        for seg in segments:
-            mins = seg.points.min(axis=0)
-            maxs = seg.points.max(axis=0)
-            x_min, y_min, x_max, y_max = seg.bbox_px
-            summaries.append(
-                {
-                    "label": seg.label,
-                    "confidence": float(seg.confidence),
-                    "reference_frame": seg.ref_frame,
-                    "num_points": float(len(seg.points)),
-                    "center_mm": _xyz((mins + maxs) / 2.0),
-                    "dims_mm": _xyz(maxs - mins),
-                    "min_mm": _xyz(mins),
-                    "max_mm": _xyz(maxs),
-                    "bbox_px": {
-                        "x_min": float(x_min), "y_min": float(y_min),
-                        "x_max": float(x_max), "y_max": float(y_max),
-                    },
-                }
-            )
-        height, width = color_np.shape[:2]
-        return {
-            "objects": summaries,
-            "snapshot_id": snapshot_id,
-            "image_width": float(width),
-            "image_height": float(height),
-        }
+        return [
+            _to_detection_3d(seg, f"{self.name}/object-{i}", snapshot_id)
+            for i, seg in enumerate(segments)
+        ]
 
     def _render_pick(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
         snapshot_id = str(command.get("snapshot_id", ""))
@@ -624,6 +609,7 @@ class Sam3Segments(Vision, EasyResource):
         return_classifications: bool = False,
         return_detections: bool = False,
         return_object_point_clouds: bool = False,
+        return_detections_3d: bool = False,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
         timeout: Optional[float] = None,
@@ -650,6 +636,10 @@ class Sam3Segments(Vision, EasyResource):
             result.objects = await self.get_object_point_clouds(
                 camera_name, extra=extra, timeout=timeout
             )
+        if return_detections_3d:
+            result.detections_3d = await self.get_detections_3d(
+                camera_name, extra=extra, timeout=timeout
+            )
         return result
 
     async def get_classifications_from_camera(
@@ -667,6 +657,7 @@ class Sam3Segments(Vision, EasyResource):
             classifications_supported=False,
             detections_supported=True,
             object_point_clouds_supported=True,
+            detections_3d_supported=True,
         )
 
     async def close(self):
@@ -682,12 +673,6 @@ class Sam3Segments(Vision, EasyResource):
         **kwargs,
     ) -> Mapping[str, ValueTypes]:
         cmd = command.get("command", "")
-        if cmd == "get_object_point_clouds":
-            try:
-                return await self._object_summaries()
-            except Exception as e:
-                LOGGER.warning(f"get_object_point_clouds command failed: {e}")
-                return {"error": str(e)}
         if cmd == "render_pick":
             try:
                 return self._render_pick(command)
@@ -728,8 +713,57 @@ class _Segment:
     bbox_px: Tuple[int, int, int, int]
 
 
-def _xyz(v: np.ndarray) -> Mapping[str, ValueTypes]:
-    return {"x": float(v[0]), "y": float(v[1]), "z": float(v[2])}
+_IDENTITY = Pose(x=0, y=0, z=0, o_x=0, o_y=0, o_z=1, theta=0)
+
+
+def _to_detection_3d(seg: _Segment, root: str, snapshot_id: str) -> Detection3D:
+    """One segment as a root frame at its bounding-box center in seg.ref_frame, carrying the box,
+    plus a `<root>/points` child carrying the segment's points relative to the root."""
+    mins = seg.points.min(axis=0)
+    maxs = seg.points.max(axis=0)
+    center = (mins + maxs) / 2.0
+    dims = maxs - mins
+    x_min, y_min, x_max, y_max = seg.bbox_px
+    return Detection3D(
+        transforms=[
+            Transform(
+                reference_frame=root,
+                pose_in_observer_frame=PoseInFrame(
+                    reference_frame=seg.ref_frame,
+                    pose=Pose(
+                        x=float(center[0]), y=float(center[1]), z=float(center[2]),
+                        o_x=0, o_y=0, o_z=1, theta=0,
+                    ),
+                ),
+                physical_object=Geometry(
+                    center=_IDENTITY,
+                    box=RectangularPrism(
+                        dims_mm=Vector3(x=float(dims[0]), y=float(dims[1]), z=float(dims[2]))
+                    ),
+                    label=seg.label,
+                ),
+            ),
+            Transform(
+                reference_frame=f"{root}/points",
+                pose_in_observer_frame=PoseInFrame(reference_frame=root, pose=_IDENTITY),
+                physical_object=Geometry(
+                    center=_IDENTITY,
+                    pointcloud=PointCloud(point_cloud=_encode_pcd_binary(seg.points - center, seg.colors)),
+                    label=seg.label,
+                ),
+            ),
+        ],
+        classifications=[Classification(class_name=seg.label, confidence=float(seg.confidence))],
+        metadata=dict_to_struct(
+            {
+                "snapshot_id": snapshot_id,
+                "bbox_px": {
+                    "x_min": float(x_min), "y_min": float(y_min),
+                    "x_max": float(x_max), "y_max": float(y_max),
+                },
+            }
+        ),
+    )
 
 
 def _to_detection(d: RawDetection) -> Detection:
