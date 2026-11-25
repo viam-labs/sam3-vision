@@ -35,7 +35,7 @@ from viam.proto.common import (
     ResourceName,
     Vector3,
 )
-from viam.proto.service.vision import Classification, Detection, GetPropertiesResponse
+from viam.proto.service.vision import Classification, Detection, Detection3D, GetPropertiesResponse
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
@@ -624,6 +624,7 @@ class Sam3Segments(Vision, EasyResource):
         return_classifications: bool = False,
         return_detections: bool = False,
         return_object_point_clouds: bool = False,
+        return_detections_3d: bool = False,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
         timeout: Optional[float] = None,
@@ -662,11 +663,21 @@ class Sam3Segments(Vision, EasyResource):
     ) -> List[Classification]:
         raise NotImplementedError("classifications not supported")
 
+    async def get_detections_3d(
+        self,
+        camera_name: str,
+        *,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> List[Detection3D]:
+        raise NotImplementedError("3D detections not supported")
+
     async def get_properties(self, *, extra=None, timeout=None) -> Vision.Properties:
         return GetPropertiesResponse(
             classifications_supported=False,
             detections_supported=True,
             object_point_clouds_supported=True,
+            detections_3d_supported=False,
         )
 
     async def close(self):
